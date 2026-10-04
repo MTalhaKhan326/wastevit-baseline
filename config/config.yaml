@@ -23,8 +23,8 @@ model:
   pretrained: false     # MUST stay false for this baseline — no transfer learning yet
 
 train:
-  epochs: 15
-  lr: 0.001
+  epochs: 30
+  lr: 0.01
   weight_decay: 0.0001
   optimizer: "adamw"    # adamw | sgd
   scheduler: "cosine"   # cosine | none
