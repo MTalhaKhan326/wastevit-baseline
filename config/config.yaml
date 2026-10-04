@@ -1,0 +1,39 @@
+# WasteViT baseline pipeline config
+# Change ONLY this file to point at a different dataset or model — code stays the same.
+
+data:
+  # Expects torchvision ImageFolder layout:
+  #   data/<dataset_name>/train/<class_a>/*.jpg, data/<dataset_name>/train/<class_b>/*.jpg, ...
+  #   data/<dataset_name>/val/<class_a>/*.jpg ...
+  #   data/<dataset_name>/test/<class_a>/*.jpg ...
+  # If only one folder of class-subfolders exists (no train/val/test split yet),
+  # set root to that folder and the loader will split it automatically.
+  root: "data/trashnet"
+  image_size: 224
+  batch_size: 32
+  num_workers: 2
+  val_split: 0.15      # used only if root has no train/val/test subfolders
+  test_split: 0.15      # used only if root has no train/val/test subfolders
+  seed: 42
+
+model:
+  # Any torchvision classification model name works: resnet18, resnet34, resnet50,
+  # mobilenet_v2, efficientnet_b0, convnext_tiny, etc.
+  architecture: "resnet18"
+  pretrained: false     # MUST stay false for this baseline — no transfer learning yet
+
+train:
+  epochs: 15
+  lr: 0.001
+  weight_decay: 0.0001
+  optimizer: "adamw"    # adamw | sgd
+  scheduler: "cosine"   # cosine | none
+  early_stopping_patience: 5
+  seed: 42
+
+mlflow:
+  experiment_name: "wastevit-baseline-from-scratch"
+  tracking_uri: "sqlite:///mlflow.db"
+  run_name: null   # null -> auto-generated from architecture + dataset
+
+output_dir: "outputs"
