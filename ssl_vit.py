@@ -4,6 +4,8 @@ ssl_vit.py - two small experiments with self-supervised Vision Transformers.
   features : TASK 1. Turn every image into a feature vector with a pretrained ViT (no training),
              then train a tiny classifier on 1, 5, 10, 20, 50, 100 labelled images per class.
              Output: accuracy-vs-number-of-labels curve (logistic regression and kNN).
+  dino     : TASK 4. Same idea as 'mae' but for DINOv2: keep training a pretrained DINOv2 on your images
+             WITHOUT labels (self-distillation, student/teacher). Saves the adapted teacher backbone.
   mae      : TASK 2. Keep training a pretrained MAE (masked autoencoder) ViT on your images
              WITHOUT labels (self-supervised adaptation). Saves the adapted model.
 
@@ -22,12 +24,18 @@ Typical flow (Kaggle notebook cells, or the THWS VM):
   # 3) Task 1 again with the adapted model, compare with res_mae_before
   python ssl_vit.py features --data DATA --model mae_adapted --out res_mae_after
 
+  # 4) Task 4: adapt DINOv2 on unlabelled images, then test it with Task 1 and compare with res_dinov2
+  python ssl_vit.py dino --data DATA --epochs 20 --out dino_adapted
+  python ssl_vit.py features --data DATA --model dino_adapted --out res_dino_after
+
 DATA is a folder with one sub-folder per class (TrashNet: cardboard, glass, metal, ...).
 The script searches below DATA for such a folder, so the exact path does not matter.
 Labels are used ONLY to evaluate the features. MAE training never sees them.
 """
 import argparse
+import copy
 import csv
+import math
 import random
 import sys
 from pathlib import Path
@@ -247,6 +255,187 @@ def cmd_mae(a):
     print(f"saved adapted model to {a.out}")
 
 
+# ---------------------------------------------------------------- views (multi-crop)
+def make_views_dataset(paths, n_local, size_global=224, size_local=98, color=0.4):
+    """Each item = tuple of tensors: (global1, global2, local1, ..., local_n). No label."""
+    import torch
+    from PIL import Image
+    from torchvision import transforms as T
+
+    bicubic = T.InterpolationMode.BICUBIC
+
+    def base(size, scale, blur_p, blur_k):
+        ops = [T.RandomResizedCrop(size, scale=scale, interpolation=bicubic), T.RandomHorizontalFlip()]
+        if color > 0:
+            ops += [T.RandomApply([T.ColorJitter(0.8 * color, 0.8 * color, 0.4 * color, 0.2 * color)], p=0.8),
+                    T.RandomGrayscale(0.2)]
+        ops += [T.RandomApply([T.GaussianBlur(blur_k, (0.1, 2.0))], p=blur_p), T.ToTensor(), T.Normalize(MEAN, STD)]
+        return T.Compose(ops)
+
+    g1 = base(size_global, (0.4, 1.0), 1.0, 23)
+    g2 = base(size_global, (0.4, 1.0), 0.1, 23)
+    loc = base(size_local, (0.05, 0.4), 0.5, 9)
+
+    class DS(torch.utils.data.Dataset):
+        def __len__(self):
+            return len(paths)
+
+        def __getitem__(self, i):
+            img = Image.open(paths[i]).convert("RGB")
+            return (g1(img), g2(img)) + tuple(loc(img) for _ in range(n_local))
+
+    return DS()
+
+
+# ---------------------------------------------------------------- model
+def build_dino(name, a, device):
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from transformers import AutoModel
+
+    class Head(nn.Module):
+        """MLP -> small bottleneck -> L2 norm -> normalised prototype layer (as in DINO)."""
+
+        def __init__(self, in_dim, hidden, bottleneck, out_dim):
+            super().__init__()
+            self.mlp = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(),
+                                     nn.Linear(hidden, hidden), nn.GELU(),
+                                     nn.Linear(hidden, bottleneck))
+            self.last = nn.Parameter(torch.randn(out_dim, bottleneck) * 0.02)   # the "prototypes"
+
+        def forward(self, x):
+            x = F.normalize(self.mlp(x), dim=-1)
+            return F.linear(x, F.normalize(self.last, dim=-1))
+
+    class Net(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = AutoModel.from_pretrained(name)
+            d = self.backbone.config.hidden_size
+            self.head = Head(d, a.head_hidden, a.bottleneck, a.out_dim)
+
+        def features(self, x):
+            out = self.backbone(pixel_values=x)
+            return out.pooler_output if getattr(out, "pooler_output", None) is not None else out.last_hidden_state[:, 0]
+
+        def forward(self, x):
+            return self.head(self.features(x))
+
+    student = Net().to(device)
+    if a.train_last_blocks > 0:                      # optional: train only the last K transformer blocks
+        for p in student.backbone.embeddings.parameters():
+            p.requires_grad = False
+        for blk in student.backbone.encoder.layer[:-a.train_last_blocks]:
+            for p in blk.parameters():
+                p.requires_grad = False
+    teacher = copy.deepcopy(student).eval()
+    for p in teacher.parameters():
+        p.requires_grad = False
+    return student, teacher
+
+
+def cosine(step, total, start, end):
+    return end + 0.5 * (start - end) * (1 + math.cos(math.pi * min(step, total) / max(1, total)))
+
+
+# ---------------------------------------------------------------- training
+def cmd_dino(a):
+    import torch
+    import torch.nn.functional as F
+
+    class_root = find_class_root(a.data)
+    paths, y, classes = list_images(class_root)
+    train_idx, _ = stratified_split(y)                 # same split as Task 1: train part only, NO labels used
+    paths = [paths[i] for i in train_idx]
+    if a.limit:                                        # smoke test: random subset (not one class only)
+        paths = random.Random(0).sample(paths, min(a.limit, len(paths)))
+    print(f"DINO adaptation on {len(paths)} unlabelled images from {class_root}")
+
+    device = get_device(a.device)
+    torch.manual_seed(a.seed)
+    student, teacher = build_dino(a.model, a, device)
+    loader = torch.utils.data.DataLoader(make_views_dataset(paths, a.n_local, color=a.color_strength),
+                                         batch_size=a.batch_size, shuffle=True, num_workers=a.workers,
+                                         drop_last=len(paths) > a.batch_size)
+    steps_per_epoch = len(loader)
+    total = a.epochs * steps_per_epoch
+    warmup = max(1, int(a.warmup_frac * total))
+    freeze_last = max(1, int(a.freeze_last_frac * total))
+
+    bb = [p for p in student.backbone.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW([{"params": bb, "lr": a.lr}, {"params": student.head.parameters(), "lr": a.head_lr}],
+                            weight_decay=a.weight_decay)
+    base_lr = [g["lr"] for g in opt.param_groups]
+    use_amp = device == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+    center = torch.zeros(1, a.out_dim, device=device)
+    print(f"{steps_per_epoch} steps/epoch, {total} steps | views per image: 2 global + {a.n_local} local | "
+          f"backbone lr {a.lr}, head lr {a.head_lr}, teacher momentum {a.momentum}->1")
+
+    step, first = 0, None
+    for ep in range(1, a.epochs + 1):
+        student.train()
+        tot_loss, tot_std, n = 0.0, 0.0, 0
+        for views in loader:
+            views = [v.to(device, non_blocking=True) for v in views]
+            f = (step + 1) / warmup if step < warmup else cosine(step - warmup, total - warmup, 1.0, 0.0)
+            for g, b in zip(opt.param_groups, base_lr):
+                g["lr"] = b * f
+            mom = cosine(step, total, a.momentum, 1.0)
+            B = views[0].shape[0]
+
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                with torch.no_grad():                                   # teacher: global views only
+                    t_feat = teacher.features(torch.cat(views[:2]))
+                    t_out = teacher.head(t_feat).float()
+                s_glob = student(torch.cat(views[:2])).float()
+                s_loc = student(torch.cat(views[2:])).float() if a.n_local > 0 else None
+
+            t_prob = F.softmax((t_out - center) / a.teacher_temp, dim=-1).chunk(2)     # centering + sharpening
+            s_logp_glob = F.log_softmax(s_glob / a.student_temp, dim=-1).chunk(2)
+            s_logp_loc = F.log_softmax(s_loc / a.student_temp, dim=-1).chunk(a.n_local) if s_loc is not None else []
+
+            loss, terms = 0.0, 0
+            for iq, q in enumerate(t_prob):                               # teacher view iq ...
+                for iv, lp in enumerate(list(s_logp_glob) + list(s_logp_loc)):   # ... vs every OTHER student view
+                    if iv == iq:
+                        continue
+                    loss = loss + torch.sum(-q * lp, dim=-1).mean()
+                    terms += 1
+            loss = loss / terms
+
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            if step < freeze_last:
+                student.head.last.grad = None                             # keep prototypes fixed at the start
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], 3.0)
+            scaler.step(opt)
+            scaler.update()
+
+            with torch.no_grad():
+                for ps, pt in zip(student.parameters(), teacher.parameters()):     # teacher = moving average
+                    pt.mul_(mom).add_(ps.detach(), alpha=1 - mom)
+                center = center * a.center_momentum + t_out.mean(0, keepdim=True) * (1 - a.center_momentum)
+                # collapse monitor: spread of the teacher's image vectors across the batch (0 = all images equal)
+                spread = F.normalize(t_feat.float(), dim=-1).std(0).mean().item()
+
+            tot_loss += loss.item() * B
+            tot_std += spread * B
+            n += B
+            step += 1
+        avg = tot_loss / n
+        first = avg if first is None else first
+        print(f"epoch {ep}/{a.epochs}  DINO loss {avg:.4f}  (epoch 1: {first:.4f})  "
+              f"feature spread {tot_std / n:.4f}", flush=True)
+
+    a.out.mkdir(parents=True, exist_ok=True)
+    teacher.backbone.save_pretrained(a.out)
+    print(f"saved adapted TEACHER backbone to {a.out}")
+    print("next: python ssl_vit.py features --data DATA --model", a.out, "--out res_dino_after")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -270,6 +459,33 @@ def main():
     m.add_argument("--limit", type=int, default=0, help="use only N images (smoke test)")
     m.add_argument("--device", default=None)
     m.set_defaults(fn=cmd_mae)
+
+    d = sub.add_parser("dino")
+    d.add_argument("--data", required=True)
+    d.add_argument("--model", default="facebook/dinov2-small")
+    d.add_argument("--out", type=Path, default=Path("dino_adapted"))
+    d.add_argument("--epochs", type=int, default=20)
+    d.add_argument("--batch-size", type=int, default=32)
+    d.add_argument("--lr", type=float, default=1e-5, help="backbone learning rate (small on purpose)")
+    d.add_argument("--head-lr", type=float, default=1e-3, help="learning rate of the new projection head")
+    d.add_argument("--weight-decay", type=float, default=0.04)
+    d.add_argument("--warmup-frac", type=float, default=0.1, help="share of steps with learning-rate warm-up")
+    d.add_argument("--freeze-last-frac", type=float, default=0.05, help="share of steps with frozen prototypes")
+    d.add_argument("--momentum", type=float, default=0.996, help="teacher moving-average momentum at start")
+    d.add_argument("--teacher-temp", type=float, default=0.04)
+    d.add_argument("--student-temp", type=float, default=0.1)
+    d.add_argument("--center-momentum", type=float, default=0.9)
+    d.add_argument("--n-local", type=int, default=6, help="number of small local crops per image")
+    d.add_argument("--out-dim", type=int, default=4096, help="number of prototypes")
+    d.add_argument("--head-hidden", type=int, default=2048)
+    d.add_argument("--bottleneck", type=int, default=256)
+    d.add_argument("--train-last-blocks", type=int, default=0, help="train only the last K blocks (0 = all)")
+    d.add_argument("--color-strength", type=float, default=0.4, help="colour jitter strength, 0 = off")
+    d.add_argument("--workers", type=int, default=4)
+    d.add_argument("--seed", type=int, default=0)
+    d.add_argument("--limit", type=int, default=0, help="use only N random images (smoke test)")
+    d.add_argument("--device", default=None)
+    d.set_defaults(fn=cmd_dino)
 
     a = ap.parse_args()
     a.fn(a)
